@@ -122,7 +122,7 @@ def interactive_args() -> argparse.Namespace:
 def wait_sta_connected(timeout=20):
     print("[AP] wait for STA association...")
     for sec in range(timeout):
-        out = run_mssh_once("wl -i wlan1 assoclist || true")
+        out = run_mssh_once(f"wl -i {config.AP_IFACE} assoclist || true")
         if out.strip():
             print(f"[AP] STA associated (after {sec+1}s)")
             return True
@@ -170,7 +170,7 @@ def parse_mcs_list(bw: int, mcs_arg: str) -> List[int]:
 def _wait_tcp_port(host: str, port: int, timeout_sec: int = 30, interval_sec: float = 1.0) -> bool:
     """
     Wait until (host, port) is reachable from THIS PC.
-    This is the correct barrier for 'PC can SSH into ASUS' (not assoclist, not iperf).
+    This is the correct barrier for 'PC can SSH into ASUS'.
     """
     deadline = time.time() + timeout_sec
     last_err = None
@@ -215,7 +215,6 @@ def _asus_pc_set_rate_with_retry(
         print(f"[ASUS-PC][RATE] attempt {attempt}/{retries}: waiting SSH port ready...")
         ok = _wait_tcp_port(host, port, timeout_sec=wait_port_timeout_sec, interval_sec=1.0)
         if not ok:
-            # keep trying (route/bridge may still be coming back)
             continue
 
         try:
@@ -232,6 +231,55 @@ def _asus_pc_set_rate_with_retry(
             time.sleep(2.0)
 
     raise RuntimeError(f"❌ ASUS-PC set rate failed after {retries} retries (host={host} port={port})")
+
+
+def _dut_ap_set_rate_5g(
+    mcs: int,
+    bw: int,
+    *,
+    nss: int = 2,
+    sgi: bool = True,
+    ldpc: bool = True,
+) -> None:
+    """
+    AP_TX requires rate lock on DUT (AP side).
+    """
+    flags = []
+    if sgi:
+        flags.append("--sgi")
+    if ldpc:
+        flags.append("--ldpc")
+
+    # NOTE: interface uses DUT AP iface (wlan1 by default)
+    cmd = (
+        f"wl -i {config.AP_IFACE} 5g_rate "
+        f"-v {mcs} -b {bw} -s {nss} "
+        + " ".join(flags)
+    ).strip()
+
+    print(f"[AP_TX][RATE] lock DUT rate MCS={mcs} bw={bw} nss={nss} sgi={int(sgi)} ldpc={int(ldpc)}")
+    # Give it a slightly longer timeout since wl can occasionally stall
+    run_mssh_once(cmd, timeout=getattr(config, "MSSH_TIMEOUT_RATE", 15))
+
+
+def _warmup_ap_tx(sec: int = 5) -> None:
+    """
+    Warm-up for AP_TX: normal direction (DUT -> server).
+    """
+    print(f"[AP_TX][WARMUP] {sec}s iperf (wait link/rate stabilize)")
+    stop_all_iperf_clients()
+
+    warmup_cmd = (
+        f"iperf3 --forceflush "
+        f"-c {config.IPERF_SERVER_AP_TX} "
+        f"-p {config.IPERF_PORT_AP_TX} "
+        f"-i 1 -t {sec}"
+    )
+    for _ in run_mssh_stream(warmup_cmd):
+        pass
+
+    stop_all_iperf_clients()
+    print("[AP_TX][WARMUP] done")
 
 
 # ==================================================
@@ -268,10 +316,6 @@ def main():
                     print("[STA_*][ASUS-AP] connect (one session per BW/CH)")
                     asus_ap.connect(force=True)
 
-                # AP_RX: DO NOT connect ASUS-PC here.
-                # Because DUT AP bring-up will flap the bridge, and your early connection can die anyway.
-                # We'll connect AFTER warm-up when we know dataplane is stable.
-
                 # ==================================================
                 # DUT AP bring-up (AP_TX / AP_RX)
                 # ==================================================
@@ -296,13 +340,14 @@ def main():
                 # ==================================================
                 # ASUS AP channel / BW (STA_* modes)
                 # ==================================================
-                if mode_cfg["need_asus_ch_bw"]:
+                if mode_cfg.get("need_asus_ch_bw"):
+                    # ASUS = AP, so use asus_ap
                     asus_ap.set_5g(channel=ch, bw=bw)
 
                 # ==================================================
                 # STA prepare (STA_TX / STA_RX)
                 # ==================================================
-                if mode_cfg["need_sta_prepare"]:
+                if mode_cfg.get("need_sta_prepare"):
                     print("[STA] setup (once per BW/CH)")
                     sta.setup()
 
@@ -316,7 +361,14 @@ def main():
                     print(f"\n→ MCS {mcs}")
 
                     # -------------------------------------------------
-                    # AP_RX: warm-up BEFORE first rate lock
+                    # AP_TX: warm-up once per BW/CH before any rate lock
+                    # -------------------------------------------------
+                    if args.mode == "AP_TX" and first_mcs:
+                        _warmup_ap_tx(sec=5)
+                        first_mcs = False
+
+                    # -------------------------------------------------
+                    # AP_RX: warm-up once per BW/CH BEFORE first rate lock
                     # -------------------------------------------------
                     if args.mode == "AP_RX" and first_mcs:
                         print("[AP_RX][WARMUP] 5s iperf -R (wait link stable)")
@@ -335,11 +387,24 @@ def main():
                         # AP_RX: connect ASUS-PC only AFTER warm-up (barrier)
                         if asus_pc:
                             print("[RX][ASUS-PC] connect AFTER warm-up (barrier)")
-                            # Wait for PC->ASUS ssh port to be reachable before connecting
                             _wait_tcp_port(config.ASUS_STA_IP, config.ASUS_AP_PORT, timeout_sec=60, interval_sec=1.0)
                             asus_pc.connect(force=True)
 
                         first_mcs = False
+
+                    # -------------------------------------------------
+                    # AP_TX: DUT rate lock per MCS (critical)
+                    # -------------------------------------------------
+                    if args.mode == "AP_TX":
+                        _dut_ap_set_rate_5g(
+                            mcs=mcs,
+                            bw=bw,
+                            nss=2,
+                            sgi=True,
+                            ldpc=True,
+                        )
+                        # small settle to let driver apply
+                        time.sleep(0.5)
 
                     # -------------------------------------------------
                     # RX rate lock (PC → ASUS) with barrier+retry
@@ -350,7 +415,7 @@ def main():
                             asus_pc=asus_pc,
                             mcs=mcs,
                             bw=bw,
-                            host=config.ASUS_STA_IP if args.mode.startswith("AP_") else config.ASUS_AP_IP,
+                            host=(config.ASUS_STA_IP if args.mode.startswith("AP_") else config.ASUS_AP_IP),
                             port=config.ASUS_AP_PORT,
                             retries=5,
                             wait_port_timeout_sec=30,
