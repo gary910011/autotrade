@@ -102,21 +102,29 @@ class STARole:
         _kill_wpa_supplicant(self.iface)
 
         # 2) iface up
+        print(f"[STA][CMD] ifconfig {self.iface} up")
         self._cmd(f"ifconfig {self.iface} up || true", ignore_error=True)
 
         # 3) start wpa_supplicant (keep your format but make it more standard/robust)
         # Your original: wpa_supplicant -B -c{conf} -i{iface}
-        # Safer: spaces + explicit -c / -i
+        print(f"[STA][CMD] wpa_supplicant -B -c{self.wpa_conf} -i{self.iface}")
         self._cmd(
-            f"wpa_supplicant -B -c {self.wpa_conf} -i {self.iface}",
+            (
+                f"nohup wpa_supplicant -B -c{self.wpa_conf} -i{self.iface} "
+                f">/tmp/wpa_{self.iface}.log 2>&1 &"
+            ),
             timeout=MSSH_TIMEOUT_SHORT,
-            ignore_error=False,
+            ignore_error=True,
         )
 
         if settle_sec > 0:
             time.sleep(settle_sec)
 
         # 4) verify link first (your manual flow checks link before static IP)
+        print(f"[STA][CMD] iw {self.iface} link")
+        link_out = self._cmd(f"iw {self.iface} link || true", timeout=MSSH_TIMEOUT_SHORT, ignore_error=True)
+        if link_out.strip():
+            print(f"[STA][LINK]\n{link_out.strip()}")
         if wait_link:
             info = self.wait_connected(timeout_sec=link_timeout_sec)
         else:
@@ -124,6 +132,7 @@ class STARole:
 
         # 5) configure static IP (keep your flow uses ifconfig <ip>)
         # Even if not connected yet, still apply IP (harmless) — but we report connected status based on iw link.
+        print(f"[STA][CMD] ifconfig {self.iface} {self.ip}")
         self._cmd(f"ifconfig {self.iface} {self.ip} || true", ignore_error=True)
 
         result = {
@@ -297,23 +306,35 @@ def sta_prepare(
         _kill_wpa_supplicant(iface)
 
         # Bring interface up (best-effort)
+        print(f"[STA][CMD] ifconfig {iface} up")
         role._cmd(f"ifconfig {iface} up || true", ignore_error=True)
 
         try:
             # Start wpa
+            print(f"[STA][CMD] wpa_supplicant -B -c{wpa_conf} -i{iface}")
             role._cmd(
-                f"wpa_supplicant -B -c {wpa_conf} -i {iface}",
+                (
+                    f"nohup wpa_supplicant -B -c{wpa_conf} -i{iface} "
+                    f">/tmp/wpa_{iface}.log 2>&1 &"
+                ),
                 timeout=MSSH_TIMEOUT_SHORT,
-                ignore_error=False,
+                ignore_error=True,
             )
 
             if settle_sec > 0:
                 time.sleep(settle_sec)
 
+            # Log link status once before waiting
+            print(f"[STA][CMD] iw {iface} link")
+            link_out = role._cmd(f"iw {iface} link || true", timeout=MSSH_TIMEOUT_SHORT, ignore_error=True)
+            if link_out.strip():
+                print(f"[STA][LINK]\n{link_out.strip()}")
+
             # Wait link
             info = role.wait_connected(timeout_sec=link_timeout_sec, poll_sec=poll_sec)
 
             # Assign IP after link (your golden flow)
+            print(f"[STA][CMD] ifconfig {iface} {ip}")
             role._cmd(f"ifconfig {iface} {ip} || true", ignore_error=True)
 
             last = {
@@ -358,8 +379,6 @@ def setup_sta() -> Dict:
 def verify_sta() -> Dict:
     info = _default_sta.get_link_info()
     return {
-        "role": "STA",
-        "iface": _default_sta.iface,
         "connected": info.connected,
         "ssid": info.ssid,
         "bssid": info.bssid,
@@ -367,7 +386,3 @@ def verify_sta() -> Dict:
         "signal_dbm": info.signal_dbm,
         "raw": info.raw,
     }
-
-
-def set_sta_rate(mcs: int, bw: int, nss: int, sgi: bool = True, ldpc: bool = True) -> Dict:
-    return _default_sta.set_rate(mcs=mcs, bw=bw, nss=nss, sgi=sgi, ldpc=ldpc)

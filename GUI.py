@@ -6,7 +6,7 @@ import subprocess
 from dataclasses import dataclass
 from typing import List
 
-from PyQt5 import QtCore, QtWidgets
+from PyQt5 import QtCore, QtGui, QtWidgets
 
 import config
 
@@ -66,24 +66,31 @@ class RunWorker(QtCore.QThread):
     def run(self) -> None:
         cmd = [sys.executable, "-u", "main.py", *self.args]
         self.log_line.emit(f"[GUI] Running: {' '.join(cmd)}")
-        self.process = subprocess.Popen(
-            cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            bufsize=1,
-        )
-        if not self.process.stdout:
+
+        try:
+            self.process = subprocess.Popen(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                bufsize=1,
+            )
+            if not self.process.stdout:
+                self.finished.emit(1)
+                return
+
+            for raw_line in self.process.stdout:
+                if self._stop_requested:
+                    break
+                line = self._decode_line(raw_line)
+                if line:
+                    self.log_line.emit(line.rstrip("\n"))
+        except Exception as exc:
+            self.log_line.emit(f"[GUI][ERROR] Runner crashed: {exc}")
             self.finished.emit(1)
             return
-
-        for line in self.process.stdout:
-            if self._stop_requested:
-                break
-            self.log_line.emit(line.rstrip("\n"))
-
-        if self._stop_requested and self.process:
-            self.process.terminate()
+        finally:
+            if self._stop_requested and self.process:
+                self._terminate_process()
 
         if self.process:
             self.process.wait()
@@ -92,7 +99,28 @@ class RunWorker(QtCore.QThread):
     def stop(self) -> None:
         self._stop_requested = True
         if self.process:
-            self.process.terminate()
+            self._terminate_process()
+
+    def _terminate_process(self) -> None:
+        if not self.process:
+            return
+        self.process.terminate()
+        try:
+            self.process.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            self.process.kill()
+
+    @staticmethod
+    def _decode_line(raw_line: bytes) -> str:
+        if isinstance(raw_line, str):
+            return raw_line
+        utf8_text = raw_line.decode("utf-8", errors="replace")
+        if "\ufffd" not in utf8_text:
+            return utf8_text
+        cp950_text = raw_line.decode("cp950", errors="replace")
+        if cp950_text.count("\ufffd") < utf8_text.count("\ufffd"):
+            return cp950_text
+        return utf8_text
 
 
 class MainWindow(QtWidgets.QMainWindow):
@@ -107,6 +135,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.total_steps = 0
 
         self._build_ui()
+        self._apply_style()
 
     def _build_ui(self) -> None:
         central = QtWidgets.QWidget()
@@ -147,6 +176,27 @@ class MainWindow(QtWidgets.QMainWindow):
         self.duration_spin.setRange(1, 3600)
         self.duration_spin.setValue(config.IPERF_DURATION)
         settings_layout.addWidget(self._labeled("Duration (sec)", self.duration_spin))
+
+        report_group = QtWidgets.QGroupBox("Report")
+        report_layout = QtWidgets.QVBoxLayout(report_group)
+
+        self.log_dir_edit = QtWidgets.QLineEdit(config.LOG_DIR)
+        self.log_dir_button = QtWidgets.QPushButton("Browse")
+        self.log_dir_button.clicked.connect(self.select_log_dir)
+        report_layout.addWidget(self._labeled_with_button("Log Folder", self.log_dir_edit, self.log_dir_button))
+
+        self.excel_path_edit = QtWidgets.QLineEdit(config.EXCEL_PATH)
+        self.excel_path_button = QtWidgets.QPushButton("Browse")
+        self.excel_path_button.clicked.connect(self.select_excel_path)
+        report_layout.addWidget(
+            self._labeled_with_button("Excel Template", self.excel_path_edit, self.excel_path_button)
+        )
+
+        self.excel_button = QtWidgets.QPushButton("Generate Excel")
+        self.excel_button.clicked.connect(self.generate_excel)
+        report_layout.addWidget(self.excel_button)
+
+        settings_layout.addWidget(report_group)
 
         self.start_button = QtWidgets.QPushButton("Start")
         self.stop_button = QtWidgets.QPushButton("Stop")
@@ -194,6 +244,20 @@ class MainWindow(QtWidgets.QMainWindow):
             checkbox.setChecked(True)
             layout.addWidget(checkbox)
         return group
+
+    def _labeled_with_button(
+        self,
+        label: str,
+        widget: QtWidgets.QWidget,
+        button: QtWidgets.QPushButton,
+    ) -> QtWidgets.QWidget:
+        container = QtWidgets.QWidget()
+        layout = QtWidgets.QHBoxLayout(container)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.addWidget(QtWidgets.QLabel(label))
+        layout.addWidget(widget, 1)
+        layout.addWidget(button)
+        return container
 
     def _labeled(self, label: str, widget: QtWidgets.QWidget) -> QtWidgets.QWidget:
         container = QtWidgets.QWidget()
@@ -254,6 +318,17 @@ class MainWindow(QtWidgets.QMainWindow):
         if self.worker:
             self.worker.stop()
             self.append_log("[GUI] Stop requested.")
+            self._stop_iperf_on_dut()
+
+    def _stop_iperf_on_dut(self) -> None:
+        try:
+            subprocess.run(
+                [sys.executable, "-c", "from dut import stop_all_iperf_clients; stop_all_iperf_clients()"],
+                check=False,
+            )
+            self.append_log("[GUI] Sent iperf stop request to DUT.")
+        except Exception as exc:
+            self.append_log(f"[GUI][WARN] Failed to stop iperf on DUT: {exc}")
 
     def append_log(self, line: str) -> None:
         self.log_view.appendPlainText(line)
@@ -276,6 +351,116 @@ class MainWindow(QtWidgets.QMainWindow):
         self.worker = None
         self.start_button.setEnabled(True)
         self.stop_button.setEnabled(False)
+
+    def closeEvent(self, event: QtCore.QEvent) -> None:
+        if self.worker:
+            self.append_log("[GUI] Closing: stopping runner...")
+            self.worker.stop()
+            self._stop_iperf_on_dut()
+            self.worker.wait(2000)
+        event.accept()
+
+    def select_log_dir(self) -> None:
+        path = QtWidgets.QFileDialog.getExistingDirectory(self, "Select Log Folder", self.log_dir_edit.text())
+        if path:
+            self.log_dir_edit.setText(path)
+
+    def select_excel_path(self) -> None:
+        path, _ = QtWidgets.QFileDialog.getOpenFileName(
+            self,
+            "Select Excel Template",
+            self.excel_path_edit.text(),
+            "Excel Files (*.xlsx);;All Files (*)",
+        )
+        if path:
+            self.excel_path_edit.setText(path)
+
+    def generate_excel(self) -> None:
+        log_dir = self.log_dir_edit.text().strip()
+        excel_path = self.excel_path_edit.text().strip()
+        if not log_dir or not excel_path:
+            QtWidgets.QMessageBox.warning(self, "Missing Path", "Please select log folder and Excel template.")
+            return
+
+        cmd = [
+            sys.executable,
+            "-u",
+            "excel.py",
+            "--log-dir",
+            log_dir,
+            "--excel-path",
+            excel_path,
+        ]
+        self.append_log(f"[GUI] Generating Excel: {' '.join(cmd)}")
+        try:
+            result = subprocess.run(cmd, capture_output=True, text=True, check=False)
+            if result.stdout:
+                self.append_log(result.stdout.strip())
+            if result.stderr:
+                self.append_log(result.stderr.strip())
+        except Exception as exc:
+            self.append_log(f"[GUI][ERROR] Excel generation failed: {exc}")
+
+    def _apply_style(self) -> None:
+        font = QtGui.QFont("Calibri", 10)
+        self.setFont(font)
+        self.setStyleSheet(
+            """
+            QMainWindow {
+                background: #f5f6f8;
+            }
+            QWidget {
+                font-family: "Calibri", "MingLiU";
+            }
+            QGroupBox {
+                font-weight: 600;
+                border: 1px solid #d0d4da;
+                border-radius: 8px;
+                margin-top: 12px;
+                padding: 8px;
+                background: #ffffff;
+            }
+            QGroupBox::title {
+                subcontrol-origin: margin;
+                left: 12px;
+                padding: 0 6px;
+                color: #2b2f36;
+            }
+            QLabel {
+                color: #2b2f36;
+            }
+            QPushButton {
+                background: #2f6fed;
+                color: white;
+                padding: 6px 12px;
+                border-radius: 6px;
+            }
+            QPushButton:disabled {
+                background: #a0a6b1;
+            }
+            QLineEdit, QSpinBox, QComboBox {
+                background: #ffffff;
+                padding: 4px 6px;
+                border: 1px solid #cfd4db;
+                border-radius: 6px;
+            }
+            QPlainTextEdit {
+                border: 1px solid #cfd4db;
+                border-radius: 6px;
+                background: #ffffff;
+            }
+            QProgressBar {
+                border: 1px solid #cfd4db;
+                border-radius: 6px;
+                text-align: center;
+                background: #ffffff;
+            }
+            QProgressBar::chunk {
+                background-color: #2f6fed;
+                border-radius: 6px;
+            }
+            """
+        )
 
 
 def main() -> None:

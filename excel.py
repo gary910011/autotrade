@@ -1,4 +1,5 @@
 # utils/excel.py
+import argparse
 import re
 from pathlib import Path
 from datetime import datetime
@@ -140,17 +141,16 @@ def parse_log(path: Path):
 # Main
 # ==================================================
 
-def main():
-    log_root = Path(LOG_DIR)
+def main(log_root: Path, excel_path: Path) -> None:
     logs = sorted(log_root.rglob("*.txt"))
 
     if not logs:
         print("❌ No log files found")
         return
 
-    wb = load_workbook(EXCEL_PATH)
+    wb = load_workbook(excel_path)
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    out_path = EXCEL_PATH.replace(".xlsx", f"_filled_{ts}.xlsx")
+    out_path = str(excel_path).replace(".xlsx", f"_filled_{ts}.xlsx")
 
     for log in logs:
         m = FILENAME_RE.search(log.name)
@@ -198,9 +198,13 @@ def main():
             ws_a.cell(row=row_a, column=col_a, value=sender_avg)
             print(f"[WRITE] Average row {row_a}, col {col_a}")
 
-    wb.save(out_path)
-    print(f"\n✅ Excel written: {out_path}")
+        wb.save(out_path)
+        print(f"\n✅ Excel written: {out_path}")
 
+    if __name__ == "__main__":
+        parser = argparse.ArgumentParser(description="Fill Excel report from tput logs.")
+        parser.add_argument("--log-dir", default=LOG_DIR, help="Root folder containing tput logs.")
+        parser.add_argument("--excel-path", default=EXCEL_PATH, help="Excel template path.")
+        args = parser.parse_args()
 
-if __name__ == "__main__":
-    main()
+        main(Path(args.log_dir), Path(args.excel_path))

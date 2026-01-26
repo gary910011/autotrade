@@ -129,6 +129,13 @@ def wait_sta_connected(timeout=20):
         time.sleep(1)
     raise RuntimeError("STA not associated after AP bring-up")
 
+def cleanup_dut_ap() -> None:
+    """
+    Ensure DUT is not running hostapd from previous AP-mode tests before STA_* runs.
+    """
+    run_mssh_once("killall hostapd || true", ignore_error=True)
+    run_mssh_once("pkill -9 hostapd || true", ignore_error=True)
+    run_mssh_once("rm -rf /var/run/hostapd || true", ignore_error=True)
 
 # ==================================================
 # CLI parser
@@ -315,6 +322,10 @@ def main():
                 if asus_ap:
                     print("[STA_*][ASUS-AP] connect (one session per BW/CH)")
                     asus_ap.connect(force=True)
+
+                if args.mode.startswith("STA_"):
+                    print("[STA_*] cleanup DUT AP services before STA mode")
+                    cleanup_dut_ap()
 
                 # ==================================================
                 # DUT AP bring-up (AP_TX / AP_RX)

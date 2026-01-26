@@ -4,7 +4,7 @@ import time
 from typing import Dict
 
 from core.dut import run_mssh_once
-from config import BW_TEMPLATE
+from config import BW_TEMPLATE, MSSH_TIMEOUT_SHORT
 
 AP_IFACE = "wlan1"
 RUNTIME_CONF = "/tmp/hostapd_runtime_wlan1.conf"
@@ -28,6 +28,7 @@ def _sh(
     label: str | None = None,
     timeout_sec: int = 5,
     retry: int = 0,
+    mssh_timeout: int | None = None,
 ) -> str:
     """
     Safe DUT shell execution with clean logging.
@@ -50,7 +51,12 @@ def _sh(
         )
 
         try:
-            out = run_mssh_once(wrapped)
+            effective_timeout = (
+                mssh_timeout
+                if mssh_timeout is not None
+                else max(MSSH_TIMEOUT_SHORT, timeout_sec + 5)
+            )
+            out = run_mssh_once(wrapped, timeout=effective_timeout)
         except Exception as e:
             if attempt < retry:
                 time.sleep(0.5)

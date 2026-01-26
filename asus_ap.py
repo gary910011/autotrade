@@ -8,7 +8,7 @@ import time
 import paramiko
 from paramiko.ssh_exception import SSHException
 
-from config import ASUS_AP_HOST, ASUS_AP_USER, ASUS_AP_PASS
+from config import ASUS_AP_IP, ASUS_AP_USER, ASUS_AP_PASS
 
 
 class AsusAP:
@@ -27,7 +27,7 @@ class AsusAP:
         - If host/user/password are not provided,
           values will be loaded from config.py
         """
-        self.host = host or ASUS_AP_HOST
+        self.host = host or ASUS_AP_IP
         self.user = user or ASUS_AP_USER
         self.password = password or ASUS_AP_PASS
         self.port = port
